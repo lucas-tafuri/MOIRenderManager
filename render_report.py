@@ -271,7 +271,16 @@ def build_summary(shots_data: List[Dict]) -> Dict[str, int]:
     }
 
 
-def build_table(shots_data: List[Dict]) -> pd.DataFrame:
+def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None) -> pd.DataFrame:
+    """
+    Build table with optional age warnings.
+    
+    Args:
+        shots_data: List of shot data dictionaries
+        age_threshold: If provided, renders older than this datetime will be marked with warnings
+    """
+    threshold_timestamp = age_threshold.timestamp() if age_threshold else None
+    
     records = []
     for shot in shots_data:
         status = "✅" if shot["all_complete"] else ("⚠️" if shot["pass_complete"] else "❌")
@@ -280,15 +289,37 @@ def build_table(shots_data: List[Dict]) -> pd.DataFrame:
             "Status": status,
             "Passes": "✅" if shot["pass_complete"] else "❌",
         }
+        
+        # Track if any pass is old
+        has_old_render = False
+        
         for key in ("S1", "S2", "BACK"):
             p: PassInfo = shot["passes"][key]
+            render_time_str = p.last_render_time
+            
+            # Check if render is old
+            is_old = False
+            if threshold_timestamp is not None and p.last_mtime is not None:
+                if p.last_mtime < threshold_timestamp:
+                    is_old = True
+                    has_old_render = True
+                    render_time_str = f"🕐 {render_time_str}"
+            
             row[f"{key}"] = p.status_icon
             row[f"{key} Frames"] = p.frame_count if p.exists else None
-            row[f"{key} Last Render"] = p.last_render_time
+            row[f"{key} Last Render"] = render_time_str
+        
         row["Preview"] = "✅" if shot["preview_exists"] else "❌"
         row["Preview Path"] = str(shot.get("preview_path") or "") if shot["preview_exists"] else ""
+        
+        # Add age warning column if threshold is set
+        if threshold_timestamp is not None:
+            row["Old Render"] = "🕐" if has_old_render else ""
+        
         records.append(row)
+    
     df = pd.DataFrame(records)
+    
     # Stable, readable column order.
     ordered_cols = [
         "Shot",
@@ -296,6 +327,13 @@ def build_table(shots_data: List[Dict]) -> pd.DataFrame:
         "Passes",
         "Preview",
         "Preview Path",
+    ]
+    
+    # Add age warning column if threshold is set
+    if threshold_timestamp is not None:
+        ordered_cols.append("Old Render")
+    
+    ordered_cols.extend([
         "S1",
         "S1 Frames",
         "S1 Last Render",
@@ -305,7 +343,8 @@ def build_table(shots_data: List[Dict]) -> pd.DataFrame:
         "BACK",
         "BACK Frames",
         "BACK Last Render",
-    ]
+    ])
+    
     for c in ordered_cols:
         if c not in df.columns:
             df[c] = ""
@@ -357,14 +396,15 @@ def render_details(
 
 def main() -> None:
     st.set_page_config(page_title="Render Report", layout="wide")
-    st.title("Render Coverage")
+    st.title("MOI Render Manager")
     st.caption("Checks passes (S1, S2, BACK) and preview presence per shot.")
 
     # Lightweight styling for a more modern look.
     st.markdown(
         """
 <style>
-  .block-container { padding-top: 1.2rem; padding-bottom: 1.2rem; }
+  .block-container { padding-top: 3rem; padding-bottom: 1.2rem; }
+  h1 { margin-top: 0.5rem; }
   div[data-testid="stMetric"] {
     background: rgba(255,255,255,0.04);
     border: 1px solid rgba(255,255,255,0.08);
@@ -410,6 +450,13 @@ def main() -> None:
         )
         st.divider()
         st.subheader("Display options")
+        enable_age_warning = st.checkbox("Warn on old renders", value=False)
+        age_threshold = st.datetime_input(
+            "Warn if render is older than",
+            value=datetime.now(),
+            help="Renders older than this date will be marked with a warning.",
+            disabled=not enable_age_warning,
+        )
         table_only_incomplete = st.checkbox("Table: only incomplete shots", value=False)
         table_search = st.text_input(
             "Table: search (substring)",
@@ -526,14 +573,30 @@ def main() -> None:
 
     summary = build_summary(shots_data)
 
-    cols = st.columns(5)
+    # Count shots with old renders if age warning is enabled
+    old_render_count = 0
+    if enable_age_warning:
+        threshold_timestamp = age_threshold.timestamp()
+        for shot in shots_data:
+            has_old = any(
+                p.last_mtime is not None and p.last_mtime < threshold_timestamp
+                for p in shot["passes"].values()
+            )
+            if has_old:
+                old_render_count += 1
+
+    cols = st.columns(6 if enable_age_warning else 5)
     cols[0].metric("Shots", summary["total"])
     cols[1].metric("All passes present", summary["passes_ok"])
     cols[2].metric("All passes + preview", summary["all_ok"])
     cols[3].metric("Missing passes", summary["missing_passes"])
     cols[4].metric("Missing preview", summary["missing_preview"])
+    if enable_age_warning:
+        cols[5].metric("Old renders 🕐", old_render_count, help=f"Shots with renders older than {age_threshold.strftime('%Y-%m-%d %H:%M')}")
 
-    table = build_table(shots_data)
+    # Build table with age threshold if enabled
+    age_threshold_dt = age_threshold if enable_age_warning else None
+    table = build_table(shots_data, age_threshold_dt)
 
     # Table filtering for readability.
     filtered = table
@@ -546,26 +609,38 @@ def main() -> None:
         ].astype(str).str.lower().str.contains(q, na=False)
         filtered = filtered[mask]
 
+    # Build column config dynamically based on whether age warning is enabled
+    column_config = {
+        "Shot": st.column_config.TextColumn(width="medium"),
+        "Status": st.column_config.TextColumn(width="small"),
+        "Passes": st.column_config.TextColumn(width="small"),
+        "Preview": st.column_config.TextColumn(width="small"),
+        "Preview Path": st.column_config.TextColumn(width="large"),
+    }
+    
+    if enable_age_warning:
+        column_config["Old Render"] = st.column_config.TextColumn(
+            width="small",
+            help="🕐 indicates renders older than the threshold date"
+        )
+    
+    column_config.update({
+        "S1": st.column_config.TextColumn(width="small"),
+        "S1 Frames": st.column_config.NumberColumn(width="small"),
+        "S1 Last Render": st.column_config.TextColumn(width="small"),
+        "S2": st.column_config.TextColumn(width="small"),
+        "S2 Frames": st.column_config.NumberColumn(width="small"),
+        "S2 Last Render": st.column_config.TextColumn(width="small"),
+        "BACK": st.column_config.TextColumn(width="small"),
+        "BACK Frames": st.column_config.NumberColumn(width="small"),
+        "BACK Last Render": st.column_config.TextColumn(width="small"),
+    })
+    
     st.dataframe(
         filtered,
         hide_index=True,
         use_container_width=True,
-        column_config={
-            "Shot": st.column_config.TextColumn(width="medium"),
-            "Status": st.column_config.TextColumn(width="small"),
-            "Passes": st.column_config.TextColumn(width="small"),
-            "Preview": st.column_config.TextColumn(width="small"),
-            "Preview Path": st.column_config.TextColumn(width="large"),
-            "S1": st.column_config.TextColumn(width="small"),
-            "S1 Frames": st.column_config.NumberColumn(width="small"),
-            "S1 Last Render": st.column_config.TextColumn(width="small"),
-            "S2": st.column_config.TextColumn(width="small"),
-            "S2 Frames": st.column_config.NumberColumn(width="small"),
-            "S2 Last Render": st.column_config.TextColumn(width="small"),
-            "BACK": st.column_config.TextColumn(width="small"),
-            "BACK Frames": st.column_config.NumberColumn(width="small"),
-            "BACK Last Render": st.column_config.TextColumn(width="small"),
-        },
+        column_config=column_config,
     )
 
     csv_data = table.to_csv(index=False).encode("utf-8")
