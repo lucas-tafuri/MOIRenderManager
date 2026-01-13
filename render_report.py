@@ -1097,31 +1097,36 @@ def main() -> None:
             if has_old:
                 old_render_count += 1
 
-    num_cols = 7 if enable_age_warning else 6
+    metrics: List[Tuple[str, int, Optional[str]]] = []
+    metrics.append(("Total Shots", summary["total"], None))
+
     if summary["cinematics_total"] > 0:
-        num_cols += 1
-    cols = st.columns(num_cols)
-    col_idx = 0
-    cols[col_idx].metric("Total Shots", summary["total"])
-    col_idx += 1
+        metrics.append(("Regular", summary["regular_total"], None))
+        metrics.append(("Cinematics", summary["cinematics_total"], None))
+
+    metrics.append(("All passes present", summary["passes_ok"], None))
+    metrics.append(("All passes + preview", summary["all_ok"], None))
+    metrics.append(("Missing passes", summary["missing_passes"], None))
+    metrics.append(("Missing preview", summary["missing_preview"], None))
+
     if summary["cinematics_total"] > 0:
-        cols[col_idx].metric("Regular", summary["regular_total"])
-        col_idx += 1
-        cols[col_idx].metric("Cinematics", summary["cinematics_total"])
-        col_idx += 1
-    cols[col_idx].metric("All passes present", summary["passes_ok"])
-    col_idx += 1
-    cols[col_idx].metric("All passes + preview", summary["all_ok"])
-    col_idx += 1
-    cols[col_idx].metric("Missing passes", summary["missing_passes"])
-    col_idx += 1
-    cols[col_idx].metric("Missing preview", summary["missing_preview"])
-    col_idx += 1
-    if summary["cinematics_total"] > 0:
-        cols[col_idx].metric("Cinematics OK", summary["cinematics_ok"])
-        col_idx += 1
+        metrics.append(("Cinematics OK", summary["cinematics_ok"], None))
+
     if enable_age_warning:
-        cols[col_idx].metric("Old renders 🕐", old_render_count, help=f"Shots with renders older than {age_threshold.strftime('%Y-%m-%d %H:%M')}")
+        metrics.append(
+            (
+                "Old renders 🕐",
+                old_render_count,
+                f"Shots with renders older than {age_threshold.strftime('%Y-%m-%d %H:%M')}",
+            )
+        )
+
+    cols = st.columns(len(metrics))
+    for i, (label, value, help_text) in enumerate(metrics):
+        if help_text:
+            cols[i].metric(label, value, help=help_text)
+        else:
+            cols[i].metric(label, value)
 
     # Build table with age threshold if enabled
     age_threshold_dt = age_threshold if enable_age_warning else None
