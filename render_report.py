@@ -1,11 +1,22 @@
 """
 Streamlit app to scan render folders and report pass coverage.
 
-Expected layout per shot (shot name = folder name, e.g. 003_0130):
+Regular shots (shot name = folder name, e.g. 003_0130):
+- Only folders matching pattern 000_0000 are scanned
 - {shot}/{shot}_P/{shot}_P_S1_nDisplayLit/*.exr
 - {shot}/{shot}_P/{shot}_P_S2_nDisplayLit/*.exr
 - {shot}/{shot}_P/{shot}_P_BACK_nDisplayLit/*.exr
+- {shot}/{shot}_S/{shot}_S_S1_nDisplayLit/*.exr
+- {shot}/{shot}_S/{shot}_S_S2_nDisplayLit/*.exr
+- {shot}/{shot}_S/{shot}_S_BACK_nDisplayLit/*.exr
 - {shot}/{shot}_Preview_S2mp4/   (preview presence only)
+
+Cinematics shots (in RENDERS/CINEMATICS/):
+- HologramReplay: Folders matching pattern 000_0000_HologramReplay (e.g. 001_0400_HologramReplay)
+  - Each shot contains camera folders: {shot}_CameraName_P and {shot}_CameraName_S
+  - Each camera folder contains a single .mov file
+- MOI: Folders starting with "MOI" (e.g. MOI_SomeName)
+  - Each folder contains a single .mov file directly inside
 """
 
 from __future__ import annotations
@@ -25,15 +36,33 @@ import streamlit as st
 DEFAULT_ROOT = Path(r"R:\02_PRODUCTION\UNREAL\RENDERS")
 
 # Folder templates for expected passes.
-PASS_FOLDERS = {
-    "S1": "{shot}_P_S1_nDisplayLit",
-    "S2": "{shot}_P_S2_nDisplayLit",
-    "BACK": "{shot}_P_BACK_nDisplayLit",
+#
+# Regular renders come in two sets:
+# - P_* under {shot}/{shot}_P/
+# - S_* under {shot}/{shot}_S/
+#
+# Each set contains S1, S2, BACK.
+PASS_FOLDERS: Dict[str, Tuple[str, str]] = {
+    "P_S1": ("P", "{shot}_P_S1_nDisplayLit"),
+    "P_S2": ("P", "{shot}_P_S2_nDisplayLit"),
+    "P_BACK": ("P", "{shot}_P_BACK_nDisplayLit"),
+    "S_S1": ("S", "{shot}_S_S1_nDisplayLit"),
+    "S_S2": ("S", "{shot}_S_S2_nDisplayLit"),
+    "S_BACK": ("S", "{shot}_S_BACK_nDisplayLit"),
 }
+
+# Stable order for display / loops.
+PASS_ORDER = ["P_S1", "P_S2", "P_BACK", "S_S1", "S_S2", "S_BACK"]
 
 EXR_NUMBER_PATTERN = re.compile(r"_(\d+)\.exr$", re.IGNORECASE)
 
 PREVIEW_FILE_PATTERN = re.compile(r".*preview.*\.mp4$", re.IGNORECASE)
+
+# Pattern to validate standard shot names: 000_0000 format
+SHOT_NAME_PATTERN = re.compile(r"^\d{3}_\d{4}$")
+
+# Pattern to match CINEMATICS shot folders: 000_0000_HologramReplay
+CINEMATICS_SHOT_PATTERN = re.compile(r"^(\d{3}_\d{4})_HologramReplay$")
 
 
 @dataclass
@@ -61,7 +90,10 @@ class PassInfo:
 
 
 def list_shots(root: Path) -> List[str]:
-    """List all shot directories, handling errors gracefully."""
+    """
+    List all shot directories matching the 000_0000 naming convention.
+    Ignores special folders like CINEMATICS, Background, etc.
+    """
     try:
         if not root.exists() or not root.is_dir():
             return []
@@ -73,7 +105,10 @@ def list_shots(root: Path) -> List[str]:
         with os.scandir(root) as entries:
             for entry in entries:
                 try:
-                    if entry.is_dir(follow_symlinks=False):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    # Only include folders matching the 000_0000 pattern
+                    if SHOT_NAME_PATTERN.match(entry.name):
                         shots.append(entry.name)
                 except (OSError, PermissionError):
                     # Skip inaccessible directories
@@ -83,6 +118,80 @@ def list_shots(root: Path) -> List[str]:
         return []
     
     return sorted(shots)
+
+
+@dataclass
+class MovInfo:
+    """Information about a .mov file in a cinematics camera folder."""
+    exists: bool
+    file_count: int = 0
+    filename: Optional[str] = None
+    last_mtime: Optional[float] = None
+    path: Optional[Path] = None
+
+    @property
+    def last_render_time(self) -> str:
+        if self.last_mtime is None:
+            return "-"
+        return datetime.fromtimestamp(self.last_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    @property
+    def status_icon(self) -> str:
+        if not self.exists:
+            return "❌"
+        if self.file_count == 0:
+            return "⚠️"
+        return "✅"
+
+
+def collect_mov_info(camera_dir: Path) -> MovInfo:
+    """
+    Scan a camera folder for .mov files.
+    Expected: single .mov file per folder.
+    """
+    try:
+        if not camera_dir.is_dir():
+            return MovInfo(False, path=camera_dir)
+    except (OSError, PermissionError):
+        return MovInfo(False, path=camera_dir)
+
+    file_count = 0
+    last_mtime: Optional[float] = None
+    filename: Optional[str] = None
+
+    try:
+        with os.scandir(camera_dir) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    name = entry.name
+                    if not name.lower().endswith(".mov"):
+                        continue
+
+                    file_count += 1
+                    if filename is None:
+                        filename = name
+
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                        if last_mtime is None or mtime > last_mtime:
+                            last_mtime = mtime
+                            filename = name
+                    except (OSError, PermissionError):
+                        continue
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        return MovInfo(True, 0, None, None, camera_dir)
+
+    return MovInfo(
+        True,
+        file_count=file_count,
+        filename=filename,
+        last_mtime=last_mtime,
+        path=camera_dir,
+    )
 
 
 def collect_pass_info(pass_dir: Path) -> PassInfo:
@@ -231,12 +340,132 @@ def find_preview(shot_dir: Path, shot: str) -> Tuple[bool, Optional[Path]]:
     return False, None
 
 
+def list_cinematics_shots(cinematics_root: Path) -> Tuple[List[str], List[str]]:
+    """
+    List all cinematics shot directories.
+    Returns (hologram_replay_shots, moi_shots) tuple.
+    """
+    try:
+        if not cinematics_root.exists() or not cinematics_root.is_dir():
+            return [], []
+    except (OSError, PermissionError):
+        return [], []
+
+    hologram_shots: List[str] = []
+    moi_shots: List[str] = []
+    try:
+        with os.scandir(cinematics_root) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    name = entry.name
+                    # Match pattern: 000_0000_HologramReplay
+                    if CINEMATICS_SHOT_PATTERN.match(name):
+                        hologram_shots.append(name)
+                    # Match folders starting with "MOI"
+                    elif name.upper().startswith("MOI"):
+                        moi_shots.append(name)
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        return [], []
+
+    return sorted(hologram_shots), sorted(moi_shots)
+
+
+def scan_moi_shot(cinematics_root: Path, shot_folder: str) -> Dict:
+    """
+    Scan an MOI folder for a single .mov file.
+    
+    Expected structure:
+    - {shot_folder}/*.mov (single .mov file directly in the folder)
+    """
+    shot_dir = cinematics_root / shot_folder
+    mov_info = collect_mov_info(shot_dir)
+    
+    return {
+        "shot": shot_folder,
+        "type": "cinematics",
+        "subtype": "moi",
+        "mov_file": mov_info,
+        "all_complete": mov_info.exists and mov_info.file_count > 0,
+    }
+
+
+def scan_cinematics_shot(cinematics_root: Path, shot_folder: str) -> Dict:
+    """
+    Scan a cinematics shot folder for camera renders.
+    
+    Expected structure:
+    - {shot_folder}/{shot_folder}_CameraName_P/*.mov
+    - {shot_folder}/{shot_folder}_CameraName_S/*.mov
+    
+    We expect 4 camera folders total (2 cameras × 2 variants: _P and _S).
+    """
+    shot_dir = cinematics_root / shot_folder
+    cameras: Dict[str, MovInfo] = {}
+
+    try:
+        if not shot_dir.is_dir():
+            return {
+                "shot": shot_folder,
+                "type": "cinematics",
+                "cameras": {},
+                "all_complete": False,
+            }
+    except (OSError, PermissionError):
+        return {
+            "shot": shot_folder,
+            "type": "cinematics",
+            "cameras": {},
+            "all_complete": False,
+        }
+
+    # Find all camera folders (ending in _P or _S)
+    camera_folders: Dict[str, Path] = {}
+    try:
+        with os.scandir(shot_dir) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    name = entry.name
+                    # Match pattern: {shot}_CameraName_P or {shot}_CameraName_S
+                    if name.endswith("_P") or name.endswith("_S"):
+                        camera_key = name  # Use full folder name as key
+                        camera_folders[camera_key] = Path(entry.path)
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        pass
+
+    # Scan each camera folder for .mov files
+    for camera_key, camera_path in camera_folders.items():
+        cameras[camera_key] = collect_mov_info(camera_path)
+
+    # Complete if all camera folders exist and have .mov files
+    all_complete = (
+        len(cameras) > 0
+        and all(cam.exists and cam.file_count > 0 for cam in cameras.values())
+    )
+
+    return {
+        "shot": shot_folder,
+        "type": "cinematics",
+        "subtype": "hologram_replay",
+        "cameras": cameras,
+        "all_complete": all_complete,
+    }
+
+
 def scan_shot(root: Path, shot: str) -> Dict:
     shot_dir = root / shot
-    passes_root = shot_dir / f"{shot}_P"
 
     passes: Dict[str, PassInfo] = {}
-    for key, folder_tpl in PASS_FOLDERS.items():
+    for key in PASS_ORDER:
+        root_suffix, folder_tpl = PASS_FOLDERS[key]
+        passes_root = shot_dir / f"{shot}_{root_suffix}"
         pass_dir = passes_root / folder_tpl.format(shot=shot)
         passes[key] = collect_pass_info(pass_dir)
 
@@ -246,6 +475,7 @@ def scan_shot(root: Path, shot: str) -> Dict:
 
     return {
         "shot": shot,
+        "type": "regular",
         "passes": passes,
         "preview_exists": preview_exists,
         "preview_path": preview_path,
@@ -256,24 +486,34 @@ def scan_shot(root: Path, shot: str) -> Dict:
 
 def build_summary(shots_data: List[Dict]) -> Dict[str, int]:
     total = len(shots_data)
-    passes_ok = sum(1 for s in shots_data if s["pass_complete"])
-    all_ok = sum(1 for s in shots_data if s["all_complete"])
+    regular_shots = [s for s in shots_data if s.get("type") == "regular"]
+    cinematics_shots = [s for s in shots_data if s.get("type") == "cinematics"]
+    
+    passes_ok = sum(1 for s in regular_shots if s.get("pass_complete", False))
+    all_ok = sum(1 for s in regular_shots if s.get("all_complete", False))
     missing_preview = sum(
-        1 for s in shots_data if s["pass_complete"] and not s["preview_exists"]
+        1 for s in regular_shots if s.get("pass_complete", False) and not s.get("preview_exists", False)
     )
-    missing_passes = total - passes_ok
+    missing_passes = len(regular_shots) - passes_ok
+    
+    cinematics_ok = sum(1 for s in cinematics_shots if s.get("all_complete", False))
+    
     return {
         "total": total,
+        "regular_total": len(regular_shots),
+        "cinematics_total": len(cinematics_shots),
         "passes_ok": passes_ok,
         "all_ok": all_ok,
         "missing_preview": missing_preview,
         "missing_passes": missing_passes,
+        "cinematics_ok": cinematics_ok,
     }
 
 
 def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None) -> pd.DataFrame:
     """
     Build table with optional age warnings.
+    Handles both regular shots and cinematics shots.
     
     Args:
         shots_data: List of shot data dictionaries
@@ -283,72 +523,167 @@ def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None
     
     records = []
     for shot in shots_data:
-        status = "✅" if shot["all_complete"] else ("⚠️" if shot["pass_complete"] else "❌")
-        row = {
-            "Shot": shot["shot"],
-            "Status": status,
-            "Passes": "✅" if shot["pass_complete"] else "❌",
-        }
+        shot_type = shot.get("type", "regular")
         
-        # Track if any pass is old
-        has_old_render = False
-        
-        for key in ("S1", "S2", "BACK"):
-            p: PassInfo = shot["passes"][key]
-            render_time_str = p.last_render_time
+        if shot_type == "cinematics":
+            subtype = shot.get("subtype", "hologram_replay")
+            status = "✅" if shot["all_complete"] else "❌"
             
-            # Check if render is old
-            is_old = False
-            if threshold_timestamp is not None and p.last_mtime is not None:
-                if p.last_mtime < threshold_timestamp:
-                    is_old = True
-                    has_old_render = True
-                    render_time_str = f"🕐 {render_time_str}"
+            if subtype == "moi":
+                # Handle MOI shots (single .mov file)
+                mov_info: MovInfo = shot.get("mov_file", MovInfo(False))
+                render_time_str = mov_info.last_render_time
+                
+                if threshold_timestamp is not None and mov_info.last_mtime is not None:
+                    if mov_info.last_mtime < threshold_timestamp:
+                        render_time_str = f"🕐 {render_time_str}"
+                
+                row = {
+                    "Shot": shot["shot"],
+                    "Type": "Cinematics (MOI)",
+                    "Status": status,
+                    "MOV File": mov_info.filename or "-",
+                    "MOV Last Render": render_time_str,
+                }
+                
+                if threshold_timestamp is not None:
+                    has_old = mov_info.last_mtime is not None and mov_info.last_mtime < threshold_timestamp
+                    row["Old Render"] = "🕐" if has_old else ""
+            else:
+                # Handle HologramReplay shots (multiple cameras)
+                row = {
+                    "Shot": shot["shot"],
+                    "Type": "Cinematics (HologramReplay)",
+                    "Status": status,
+                    "Cameras": len(shot.get("cameras", {})),
+                }
+                
+                # Add camera information
+                cameras = shot.get("cameras", {})
+                camera_names = sorted(cameras.keys())
+                for i, cam_name in enumerate(camera_names[:4]):  # Limit to 4 cameras
+                    cam: MovInfo = cameras[cam_name]
+                    render_time_str = cam.last_render_time
+                    
+                    is_old = False
+                    if threshold_timestamp is not None and cam.last_mtime is not None:
+                        if cam.last_mtime < threshold_timestamp:
+                            is_old = True
+                            render_time_str = f"🕐 {render_time_str}"
+                    
+                    row[f"Camera {i+1}"] = cam.status_icon
+                    row[f"Camera {i+1} File"] = cam.filename or "-"
+                    row[f"Camera {i+1} Last Render"] = render_time_str
+                
+                # Fill empty camera slots
+                for i in range(len(camera_names), 4):
+                    row[f"Camera {i+1}"] = ""
+                    row[f"Camera {i+1} File"] = ""
+                    row[f"Camera {i+1} Last Render"] = ""
+                
+                if threshold_timestamp is not None:
+                    has_old = any(
+                        c.last_mtime is not None and c.last_mtime < threshold_timestamp
+                        for c in cameras.values()
+                    )
+                    row["Old Render"] = "🕐" if has_old else ""
+        else:
+            # Handle regular shots
+            status = "✅" if shot["all_complete"] else ("⚠️" if shot.get("pass_complete", False) else "❌")
+            row = {
+                "Shot": shot["shot"],
+                "Type": "Regular",
+                "Status": status,
+                "Passes": "✅" if shot.get("pass_complete", False) else "❌",
+            }
             
-            row[f"{key}"] = p.status_icon
-            row[f"{key} Frames"] = p.frame_count if p.exists else None
-            row[f"{key} Last Render"] = render_time_str
-        
-        row["Preview"] = "✅" if shot["preview_exists"] else "❌"
-        row["Preview Path"] = str(shot.get("preview_path") or "") if shot["preview_exists"] else ""
-        
-        # Add age warning column if threshold is set
-        if threshold_timestamp is not None:
-            row["Old Render"] = "🕐" if has_old_render else ""
+            # Track if any pass is old
+            has_old_render = False
+            
+            for key in PASS_ORDER:
+                p: PassInfo = shot.get("passes", {}).get(key, PassInfo(False))
+                render_time_str = p.last_render_time
+                
+                # Check if render is old
+                is_old = False
+                if threshold_timestamp is not None and p.last_mtime is not None:
+                    if p.last_mtime < threshold_timestamp:
+                        is_old = True
+                        has_old_render = True
+                        render_time_str = f"🕐 {render_time_str}"
+                
+                row[f"{key}"] = p.status_icon
+                row[f"{key} Frames"] = p.frame_count if p.exists else None
+                row[f"{key} Last Render"] = render_time_str
+            
+            row["Preview"] = "✅" if shot.get("preview_exists", False) else "❌"
+            row["Preview Path"] = str(shot.get("preview_path") or "") if shot.get("preview_exists", False) else ""
+            
+            # Add age warning column if threshold is set
+            if threshold_timestamp is not None:
+                row["Old Render"] = "🕐" if has_old_render else ""
         
         records.append(row)
     
     df = pd.DataFrame(records)
     
-    # Stable, readable column order.
-    ordered_cols = [
-        "Shot",
-        "Status",
-        "Passes",
-        "Preview",
-        "Preview Path",
-    ]
-    
-    # Add age warning column if threshold is set
-    if threshold_timestamp is not None:
-        ordered_cols.append("Old Render")
-    
-    ordered_cols.extend([
-        "S1",
-        "S1 Frames",
-        "S1 Last Render",
-        "S2",
-        "S2 Frames",
-        "S2 Last Render",
-        "BACK",
-        "BACK Frames",
-        "BACK Last Render",
-    ])
+    # Build column order based on what we have
+    if records and "Type" in records[0]:
+        # Mixed table with both types
+        base_cols = ["Shot", "Type", "Status"]
+        
+        # Check if we have regular shots
+        has_regular = any(r.get("Type") == "Regular" for r in records)
+        # Check if we have cinematics
+        has_cinematics = any(r.get("Type") == "Cinematics" for r in records)
+        
+        ordered_cols = base_cols.copy()
+        
+        if has_regular:
+            ordered_cols.extend(["Passes", "Preview", "Preview Path"])
+            if threshold_timestamp is not None:
+                ordered_cols.append("Old Render")
+            for key in PASS_ORDER:
+                ordered_cols.extend([f"{key}", f"{key} Frames", f"{key} Last Render"])
+        elif has_cinematics:
+            # Check if we have MOI shots (different columns)
+            has_moi = any(r.get("Type") == "Cinematics (MOI)" for r in records)
+            has_hologram = any(r.get("Type") == "Cinematics (HologramReplay)" for r in records)
+            
+            if has_moi and has_hologram:
+                # Mixed cinematics - include both column sets
+                ordered_cols.extend(["Cameras", "MOV File", "MOV Last Render"])
+                if threshold_timestamp is not None:
+                    ordered_cols.append("Old Render")
+                for i in range(1, 5):
+                    ordered_cols.extend([f"Camera {i}", f"Camera {i} File", f"Camera {i} Last Render"])
+            elif has_moi:
+                # Only MOI shots
+                ordered_cols.extend(["MOV File", "MOV Last Render"])
+                if threshold_timestamp is not None:
+                    ordered_cols.append("Old Render")
+            else:
+                # Only HologramReplay shots
+                ordered_cols.extend(["Cameras"])
+                if threshold_timestamp is not None:
+                    ordered_cols.append("Old Render")
+                for i in range(1, 5):
+                    ordered_cols.extend([f"Camera {i}", f"Camera {i} File", f"Camera {i} Last Render"])
+    else:
+        # Fallback to old structure
+        ordered_cols = ["Shot", "Status", "Passes", "Preview", "Preview Path"]
+        if threshold_timestamp is not None:
+            ordered_cols.append("Old Render")
+        for key in PASS_ORDER:
+            ordered_cols.extend([f"{key}", f"{key} Frames", f"{key} Last Render"])
     
     for c in ordered_cols:
         if c not in df.columns:
             df[c] = ""
-    return df[ordered_cols]
+    
+    # Only return columns that exist in the dataframe
+    existing_cols = [c for c in ordered_cols if c in df.columns]
+    return df[existing_cols]
 
 
 def render_details(
@@ -356,42 +691,92 @@ def render_details(
 ) -> None:
     rendered = 0
     for shot in shots_data:
-        if only_incomplete and shot["all_complete"]:
+        if only_incomplete and shot.get("all_complete", False):
             continue
         rendered += 1
         if rendered > max_shots:
             st.info(f"Details limited to first {max_shots} shots. Adjust in the sidebar.")
             break
-        with st.expander(f"{shot['shot']}"):
-            cols = st.columns(4)
-            cols[0].markdown(f"**All passes:** {'✅' if shot['pass_complete'] else '❌'}")
-            cols[1].markdown(f"**Preview:** {'✅' if shot['preview_exists'] else '❌'}")
-            cols[2].markdown(
-                f"**Complete:** {'✅' if shot['all_complete'] else '❌'}"
-            )
-            cols[3].markdown(f"**Pass root:** `{shot['shot']}_P`")
+        
+        shot_type = shot.get("type", "regular")
+        subtype = shot.get("subtype", "")
+        display_type = f"{shot_type}" + (f" ({subtype})" if subtype else "")
+        with st.expander(f"{shot['shot']} ({display_type})"):
+            if shot_type == "cinematics":
+                if subtype == "moi":
+                    # MOI shot - single .mov file
+                    mov_info: MovInfo = shot.get("mov_file", MovInfo(False))
+                    cols = st.columns(2)
+                    cols[0].markdown(f"**Complete:** {'✅' if shot['all_complete'] else '❌'}")
+                    cols[1].markdown(f"**Type:** MOI")
+                    
+                    st.markdown("**MOV File**")
+                    st.write(
+                        {
+                            "File": mov_info.filename or "-",
+                            "File count": mov_info.file_count,
+                            "Last render": mov_info.last_render_time,
+                            "Path": str(mov_info.path) if mov_info.path else "-",
+                        }
+                    )
+                else:
+                    # HologramReplay shot - multiple cameras
+                    cols = st.columns(2)
+                    cols[0].markdown(f"**Complete:** {'✅' if shot['all_complete'] else '❌'}")
+                    cols[1].markdown(f"**Cameras found:** {len(shot.get('cameras', {}))}")
+                    
+                    cameras = shot.get("cameras", {})
+                    if cameras:
+                        for cam_name, cam_info in sorted(cameras.items()):
+                            st.markdown(f"**{cam_name}** — {cam_info.status_icon}")
+                            st.write(
+                                {
+                                    "File": cam_info.filename or "-",
+                                    "File count": cam_info.file_count,
+                                    "Last render": cam_info.last_render_time,
+                                    "Path": str(cam_info.path) if cam_info.path else "-",
+                                }
+                            )
+                    else:
+                        st.info("No camera folders found.")
+            else:
+                cols = st.columns(4)
+                cols[0].markdown(f"**All passes:** {'✅' if shot.get('pass_complete', False) else '❌'}")
+                cols[1].markdown(f"**Preview:** {'✅' if shot.get('preview_exists', False) else '❌'}")
+                cols[2].markdown(
+                    f"**Complete:** {'✅' if shot.get('all_complete', False) else '❌'}"
+                )
+                cols[3].markdown(f"**Pass root:** `{shot['shot']}_P`")
 
-            for key, label in (("S1", "Pass 1"), ("S2", "Pass 2"), ("BACK", "Pass 3")):
-                info: PassInfo = shot["passes"][key]
-                st.markdown(f"**{label} ({key})** — {info.status_icon}")
+                pass_labels = [
+                    ("P_S1", "P Pass 1"),
+                    ("P_S2", "P Pass 2"),
+                    ("P_BACK", "P Back"),
+                    ("S_S1", "S Pass 1"),
+                    ("S_S2", "S Pass 2"),
+                    ("S_BACK", "S Back"),
+                ]
+                for key, label in pass_labels:
+                    info: PassInfo = shot.get("passes", {}).get(key, PassInfo(False))
+                    st.markdown(f"**{label} ({key})** — {info.status_icon}")
+                    st.write(
+                        {
+                            "Frames": info.frame_count if info.exists else 0,
+                            "First frame": info.first_frame or "-",
+                            "Last frame": info.last_frame or "-",
+                            "Last render": info.last_render_time,
+                            "Path": str(info.path) if info.path else "-",
+                        }
+                    )
+                st.markdown("**Preview**")
                 st.write(
                     {
-                        "Frames": info.frame_count if info.exists else 0,
-                        "First frame": info.first_frame or "-",
-                        "Last frame": info.last_frame or "-",
-                        "Last render": info.last_render_time,
-                        "Path": str(info.path) if info.path else "-",
+                        "Detected": bool(shot.get("preview_exists", False)),
+                        "Path": str(shot.get("preview_path") or "-"),
+                        "Expected legacy folder": f"{shot['shot']}_Preview_S2mp4",
+                        "Expected file (common)": f"{shot['shot']}_Preview_S2.mp4",
                     }
                 )
-            st.markdown("**Preview**")
-            st.write(
-                {
-                    "Detected": bool(shot["preview_exists"]),
-                    "Path": str(shot.get("preview_path") or "-"),
-                    "Expected legacy folder": f"{shot['shot']}_Preview_S2mp4",
-                    "Expected file (common)": f"{shot['shot']}_Preview_S2.mp4",
-                }
-            )
 
 
 def main() -> None:
@@ -511,52 +896,145 @@ def main() -> None:
 
     if should_scan:
         with st.spinner("Scanning render folders..."):
+            # Scan regular shots
             shots = list_shots(root_path)
-            if not shots:
+            
+            # Scan cinematics shots
+            cinematics_root = root_path / "CINEMATICS"
+            hologram_shots = []
+            moi_shots = []
+            if cinematics_root.exists() and cinematics_root.is_dir():
+                hologram_shots, moi_shots = list_cinematics_shots(cinematics_root)
+
+            if not shots and not hologram_shots and not moi_shots:
                 st.warning(f"No shot directories found in {root_path}")
                 return
 
+            # Apply filter to all shots
             if shot_filter_re is not None:
                 shots = [s for s in shots if shot_filter_re.search(s)]
-                if not shots:
+                hologram_shots = [s for s in hologram_shots if shot_filter_re.search(s)]
+                moi_shots = [s for s in moi_shots if shot_filter_re.search(s)]
+                if not shots and not hologram_shots and not moi_shots:
                     st.warning("No shots matched the filter.")
                     return
 
+            # Apply max shots limit
+            total_shots = len(shots) + len(hologram_shots) + len(moi_shots)
             if max_shots_to_scan and max_shots_to_scan > 0:
-                shots = shots[: int(max_shots_to_scan)]
+                # Distribute limit proportionally
+                if total_shots > max_shots_to_scan:
+                    shots_ratio = len(shots) / total_shots if total_shots > 0 else 0
+                    hologram_ratio = len(hologram_shots) / total_shots if total_shots > 0 else 0
+                    shots_limit = int(max_shots_to_scan * shots_ratio)
+                    hologram_limit = int(max_shots_to_scan * hologram_ratio)
+                    moi_limit = max_shots_to_scan - shots_limit - hologram_limit
+                    shots = shots[:shots_limit]
+                    hologram_shots = hologram_shots[:hologram_limit]
+                    moi_shots = moi_shots[:moi_limit]
 
             progress_bar = st.progress(0)
+            total_to_scan = len(shots) + len(hologram_shots) + len(moi_shots)
+            done_count = 0
 
             shots_data: List[Dict] = []
-            if use_threads and len(shots) > 1:
-                results_by_shot: Dict[str, Dict] = {}
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=int(max_workers)
-                ) as executor:
-                    future_map = {
-                        executor.submit(scan_shot, root_path, shot): shot for shot in shots
-                    }
-                    done = 0
-                    for fut in concurrent.futures.as_completed(future_map):
-                        shot = future_map[fut]
-                        try:
-                            results_by_shot[shot] = fut.result()
-                        except Exception:
-                            # Be resilient: keep going and mark this shot as failed/missing.
-                            results_by_shot[shot] = {
-                                "shot": shot,
-                                "passes": {k: PassInfo(False) for k in PASS_FOLDERS.keys()},
-                                "preview_exists": False,
-                                "pass_complete": False,
-                                "all_complete": False,
-                            }
-                        done += 1
-                        progress_bar.progress(done / len(shots))
-                shots_data = [results_by_shot[s] for s in sorted(results_by_shot)]
-            else:
-                for i, shot in enumerate(shots):
-                    shots_data.append(scan_shot(root_path, shot))
-                    progress_bar.progress((i + 1) / len(shots))
+            
+            # Scan regular shots
+            if shots:
+                if use_threads and len(shots) > 1:
+                    results_by_shot: Dict[str, Dict] = {}
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=int(max_workers)
+                    ) as executor:
+                        future_map = {
+                            executor.submit(scan_shot, root_path, shot): shot for shot in shots
+                        }
+                        for fut in concurrent.futures.as_completed(future_map):
+                            shot = future_map[fut]
+                            try:
+                                results_by_shot[shot] = fut.result()
+                            except Exception:
+                                # Be resilient: keep going and mark this shot as failed/missing.
+                                results_by_shot[shot] = {
+                                    "shot": shot,
+                                    "type": "regular",
+                                    "passes": {k: PassInfo(False) for k in PASS_FOLDERS.keys()},
+                                    "preview_exists": False,
+                                    "pass_complete": False,
+                                    "all_complete": False,
+                                }
+                            done_count += 1
+                            progress_bar.progress(done_count / total_to_scan)
+                    shots_data.extend([results_by_shot[s] for s in sorted(results_by_shot)])
+                else:
+                    for i, shot in enumerate(shots):
+                        shots_data.append(scan_shot(root_path, shot))
+                        done_count += 1
+                        progress_bar.progress(done_count / total_to_scan)
+            
+            # Scan HologramReplay shots
+            if hologram_shots:
+                if use_threads and len(hologram_shots) > 1:
+                    results_by_shot: Dict[str, Dict] = {}
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=int(max_workers)
+                    ) as executor:
+                        future_map = {
+                            executor.submit(scan_cinematics_shot, cinematics_root, shot): shot 
+                            for shot in hologram_shots
+                        }
+                        for fut in concurrent.futures.as_completed(future_map):
+                            shot = future_map[fut]
+                            try:
+                                results_by_shot[shot] = fut.result()
+                            except Exception:
+                                results_by_shot[shot] = {
+                                    "shot": shot,
+                                    "type": "cinematics",
+                                    "subtype": "hologram_replay",
+                                    "cameras": {},
+                                    "all_complete": False,
+                                }
+                            done_count += 1
+                            progress_bar.progress(done_count / total_to_scan)
+                    shots_data.extend([results_by_shot[s] for s in sorted(results_by_shot)])
+                else:
+                    for shot in hologram_shots:
+                        shots_data.append(scan_cinematics_shot(cinematics_root, shot))
+                        done_count += 1
+                        progress_bar.progress(done_count / total_to_scan)
+            
+            # Scan MOI shots
+            if moi_shots:
+                if use_threads and len(moi_shots) > 1:
+                    results_by_shot: Dict[str, Dict] = {}
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=int(max_workers)
+                    ) as executor:
+                        future_map = {
+                            executor.submit(scan_moi_shot, cinematics_root, shot): shot 
+                            for shot in moi_shots
+                        }
+                        for fut in concurrent.futures.as_completed(future_map):
+                            shot = future_map[fut]
+                            try:
+                                results_by_shot[shot] = fut.result()
+                            except Exception:
+                                results_by_shot[shot] = {
+                                    "shot": shot,
+                                    "type": "cinematics",
+                                    "subtype": "moi",
+                                    "mov_file": MovInfo(False),
+                                    "all_complete": False,
+                                }
+                            done_count += 1
+                            progress_bar.progress(done_count / total_to_scan)
+                    shots_data.extend([results_by_shot[s] for s in sorted(results_by_shot)])
+                else:
+                    for shot in moi_shots:
+                        shots_data.append(scan_moi_shot(cinematics_root, shot))
+                        done_count += 1
+                        progress_bar.progress(done_count / total_to_scan)
 
             progress_bar.empty()
 
@@ -582,21 +1060,50 @@ def main() -> None:
     if enable_age_warning:
         threshold_timestamp = age_threshold.timestamp()
         for shot in shots_data:
-            has_old = any(
-                p.last_mtime is not None and p.last_mtime < threshold_timestamp
-                for p in shot["passes"].values()
-            )
+            if shot.get("type") == "cinematics":
+                if shot.get("subtype") == "moi":
+                    # MOI shot - check mov_file
+                    mov_info = shot.get("mov_file", MovInfo(False))
+                    has_old = mov_info.last_mtime is not None and mov_info.last_mtime < threshold_timestamp
+                else:
+                    # HologramReplay shot - check cameras
+                    has_old = any(
+                        c.last_mtime is not None and c.last_mtime < threshold_timestamp
+                        for c in shot.get("cameras", {}).values()
+                    )
+            else:
+                has_old = any(
+                    p.last_mtime is not None and p.last_mtime < threshold_timestamp
+                    for p in shot.get("passes", {}).values()
+                )
             if has_old:
                 old_render_count += 1
 
-    cols = st.columns(6 if enable_age_warning else 5)
-    cols[0].metric("Shots", summary["total"])
-    cols[1].metric("All passes present", summary["passes_ok"])
-    cols[2].metric("All passes + preview", summary["all_ok"])
-    cols[3].metric("Missing passes", summary["missing_passes"])
-    cols[4].metric("Missing preview", summary["missing_preview"])
+    num_cols = 7 if enable_age_warning else 6
+    if summary["cinematics_total"] > 0:
+        num_cols += 1
+    cols = st.columns(num_cols)
+    col_idx = 0
+    cols[col_idx].metric("Total Shots", summary["total"])
+    col_idx += 1
+    if summary["cinematics_total"] > 0:
+        cols[col_idx].metric("Regular", summary["regular_total"])
+        col_idx += 1
+        cols[col_idx].metric("Cinematics", summary["cinematics_total"])
+        col_idx += 1
+    cols[col_idx].metric("All passes present", summary["passes_ok"])
+    col_idx += 1
+    cols[col_idx].metric("All passes + preview", summary["all_ok"])
+    col_idx += 1
+    cols[col_idx].metric("Missing passes", summary["missing_passes"])
+    col_idx += 1
+    cols[col_idx].metric("Missing preview", summary["missing_preview"])
+    col_idx += 1
+    if summary["cinematics_total"] > 0:
+        cols[col_idx].metric("Cinematics OK", summary["cinematics_ok"])
+        col_idx += 1
     if enable_age_warning:
-        cols[5].metric("Old renders 🕐", old_render_count, help=f"Shots with renders older than {age_threshold.strftime('%Y-%m-%d %H:%M')}")
+        cols[col_idx].metric("Old renders 🕐", old_render_count, help=f"Shots with renders older than {age_threshold.strftime('%Y-%m-%d %H:%M')}")
 
     # Build table with age threshold if enabled
     age_threshold_dt = age_threshold if enable_age_warning else None
@@ -608,37 +1115,73 @@ def main() -> None:
         filtered = filtered[filtered["Status"] != "✅"]
     if table_search.strip():
         q = table_search.strip().lower()
-        mask = filtered["Shot"].astype(str).str.lower().str.contains(q, na=False) | filtered[
-            "Preview Path"
-        ].astype(str).str.lower().str.contains(q, na=False)
+        # Build search mask across multiple columns
+        mask = filtered["Shot"].astype(str).str.lower().str.contains(q, na=False)
+        if "Preview Path" in filtered.columns:
+            mask = mask | filtered["Preview Path"].astype(str).str.lower().str.contains(q, na=False)
+        # Also search in camera file columns for cinematics
+        for i in range(1, 5):
+            col_name = f"Camera {i} File"
+            if col_name in filtered.columns:
+                mask = mask | filtered[col_name].astype(str).str.lower().str.contains(q, na=False)
+        # Search in MOV File column for MOI shots
+        if "MOV File" in filtered.columns:
+            mask = mask | filtered["MOV File"].astype(str).str.lower().str.contains(q, na=False)
         filtered = filtered[mask]
 
-    # Build column config dynamically based on whether age warning is enabled
+    # Build column config dynamically based on content
     column_config = {
         "Shot": st.column_config.TextColumn(width="medium"),
+        "Type": st.column_config.TextColumn(width="small"),
         "Status": st.column_config.TextColumn(width="small"),
-        "Passes": st.column_config.TextColumn(width="small"),
-        "Preview": st.column_config.TextColumn(width="small"),
-        "Preview Path": st.column_config.TextColumn(width="large"),
     }
+    
+    # Add regular shot columns
+    if any(s.get("type") == "regular" for s in shots_data):
+        column_config.update({
+            "Passes": st.column_config.TextColumn(width="small"),
+            "Preview": st.column_config.TextColumn(width="small"),
+            "Preview Path": st.column_config.TextColumn(width="large"),
+            "P_S1": st.column_config.TextColumn(width="small"),
+            "P_S1 Frames": st.column_config.NumberColumn(width="small"),
+            "P_S1 Last Render": st.column_config.TextColumn(width="small"),
+            "P_S2": st.column_config.TextColumn(width="small"),
+            "P_S2 Frames": st.column_config.NumberColumn(width="small"),
+            "P_S2 Last Render": st.column_config.TextColumn(width="small"),
+            "P_BACK": st.column_config.TextColumn(width="small"),
+            "P_BACK Frames": st.column_config.NumberColumn(width="small"),
+            "P_BACK Last Render": st.column_config.TextColumn(width="small"),
+            "S_S1": st.column_config.TextColumn(width="small"),
+            "S_S1 Frames": st.column_config.NumberColumn(width="small"),
+            "S_S1 Last Render": st.column_config.TextColumn(width="small"),
+            "S_S2": st.column_config.TextColumn(width="small"),
+            "S_S2 Frames": st.column_config.NumberColumn(width="small"),
+            "S_S2 Last Render": st.column_config.TextColumn(width="small"),
+            "S_BACK": st.column_config.TextColumn(width="small"),
+            "S_BACK Frames": st.column_config.NumberColumn(width="small"),
+            "S_BACK Last Render": st.column_config.TextColumn(width="small"),
+        })
+    
+    # Add cinematics columns
+    has_moi = any(s.get("type") == "cinematics" and s.get("subtype") == "moi" for s in shots_data)
+    has_hologram = any(s.get("type") == "cinematics" and s.get("subtype") == "hologram_replay" for s in shots_data)
+    
+    if has_moi:
+        column_config["MOV File"] = st.column_config.TextColumn(width="medium")
+        column_config["MOV Last Render"] = st.column_config.TextColumn(width="small")
+    
+    if has_hologram:
+        column_config["Cameras"] = st.column_config.NumberColumn(width="small")
+        for i in range(1, 5):
+            column_config[f"Camera {i}"] = st.column_config.TextColumn(width="small")
+            column_config[f"Camera {i} File"] = st.column_config.TextColumn(width="medium")
+            column_config[f"Camera {i} Last Render"] = st.column_config.TextColumn(width="small")
     
     if enable_age_warning:
         column_config["Old Render"] = st.column_config.TextColumn(
             width="small",
             help="🕐 indicates renders older than the threshold date"
         )
-    
-    column_config.update({
-        "S1": st.column_config.TextColumn(width="small"),
-        "S1 Frames": st.column_config.NumberColumn(width="small"),
-        "S1 Last Render": st.column_config.TextColumn(width="small"),
-        "S2": st.column_config.TextColumn(width="small"),
-        "S2 Frames": st.column_config.NumberColumn(width="small"),
-        "S2 Last Render": st.column_config.TextColumn(width="small"),
-        "BACK": st.column_config.TextColumn(width="small"),
-        "BACK Frames": st.column_config.NumberColumn(width="small"),
-        "BACK Last Render": st.column_config.TextColumn(width="small"),
-    })
     
     st.dataframe(
         filtered,
