@@ -61,8 +61,9 @@ PREVIEW_FILE_PATTERN = re.compile(r".*preview.*\.mp4$", re.IGNORECASE)
 # Pattern to validate standard shot names: 000_0000 format
 SHOT_NAME_PATTERN = re.compile(r"^\d{3}_\d{4}$")
 
-# Pattern to match CINEMATICS shot folders: 000_0000_HologramReplay
-CINEMATICS_SHOT_PATTERN = re.compile(r"^(\d{3}_\d{4})_HologramReplay$")
+# Pattern to match CINEMATICS replay shot folders.
+# Be permissive: allow optional suffixes after "HologramReplay" (e.g. _v2).
+CINEMATICS_SHOT_PATTERN = re.compile(r"^(\d{3}_\d{4})_HologramReplay.*$", re.IGNORECASE)
 
 
 @dataclass
@@ -869,6 +870,14 @@ def main() -> None:
     root_input = st.text_input("Renders root", value=str(DEFAULT_ROOT))
     root_path = Path(root_input).expanduser()
 
+    # Show where cinematics will be scanned from (helps diagnose missing rows).
+    cinematics_scan_path = (
+        root_path
+        if root_path.name.upper() == "CINEMATICS"
+        else (root_path / "CINEMATICS")
+    )
+    st.caption(f"Cinematics scan path: `{cinematics_scan_path}`")
+
     if not root_path.exists():
         st.error(f"Path does not exist: {root_path}")
         return
@@ -899,12 +908,21 @@ def main() -> None:
             # Scan regular shots
             shots = list_shots(root_path)
             
-            # Scan cinematics shots
-            cinematics_root = root_path / "CINEMATICS"
+            # Scan cinematics shots.
+            # Users may point the root either at .../RENDERS or directly at .../RENDERS/CINEMATICS.
+            cinematics_root = (
+                root_path
+                if root_path.name.upper() == "CINEMATICS"
+                else (root_path / "CINEMATICS")
+            )
             hologram_shots = []
             moi_shots = []
             if cinematics_root.exists() and cinematics_root.is_dir():
                 hologram_shots, moi_shots = list_cinematics_shots(cinematics_root)
+            else:
+                # Helpful hint when CINEMATICS isn't present at the expected location.
+                if root_path.name.upper() != "CINEMATICS":
+                    st.info(f"No `CINEMATICS` folder found at: `{cinematics_root}`")
 
             if not shots and not hologram_shots and not moi_shots:
                 st.warning(f"No shot directories found in {root_path}")
