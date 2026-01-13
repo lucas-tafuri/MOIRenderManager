@@ -451,11 +451,15 @@ def main() -> None:
         st.divider()
         st.subheader("Display options")
         enable_age_warning = st.checkbox("Warn on old renders", value=False)
+        # Initialize age_threshold in session state if not present
+        if "age_threshold" not in st.session_state:
+            st.session_state["age_threshold"] = datetime.now()
         age_threshold = st.datetime_input(
             "Warn if render is older than",
-            value=datetime.now(),
+            value=st.session_state["age_threshold"],
             help="Renders older than this date will be marked with a warning.",
             disabled=not enable_age_warning,
+            key="age_threshold",
         )
         table_only_incomplete = st.checkbox("Table: only incomplete shots", value=False)
         table_search = st.text_input(
