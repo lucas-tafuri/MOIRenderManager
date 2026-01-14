@@ -3,12 +3,10 @@ Streamlit app to scan render folders and report pass coverage.
 
 Regular shots (shot name = folder name, e.g. 003_0130):
 - Only folders matching pattern 000_0000 are scanned
-- {shot}/{shot}_P/{shot}_P_S1_nDisplayLit/*.exr
-- {shot}/{shot}_P/{shot}_P_S2_nDisplayLit/*.exr
-- {shot}/{shot}_P/{shot}_P_BACK_nDisplayLit/*.exr
-- {shot}/{shot}_S/{shot}_S_S1_nDisplayLit/*.exr
-- {shot}/{shot}_S/{shot}_S_S2_nDisplayLit/*.exr
-- {shot}/{shot}_S/{shot}_S_BACK_nDisplayLit/*.exr
+- Tracked passes (current):
+  - {shot}/{shot}_P/{shot}_P_S2_nDisplayLit/*.exr
+  - {shot}/{shot}_S/{shot}_S_S1_nDisplayLit/*.exr
+  - {shot}/{shot}_S/{shot}_S_BACK_nDisplayLit/*.exr
 - {shot}/{shot}_Preview_S2mp4/   (preview presence only)
 
 Cinematics shots (in RENDERS/CINEMATICS/):
@@ -42,17 +40,19 @@ DEFAULT_ROOT = Path(r"R:\02_PRODUCTION\UNREAL\RENDERS")
 # - S_* under {shot}/{shot}_S/
 #
 # Each set contains S1, S2, BACK.
+# Regular pass folders we actively track.
+# Per latest requirements, only these passes are required/checked:
+# - P_S2
+# - S_S1
+# - S_BACK
 PASS_FOLDERS: Dict[str, Tuple[str, str]] = {
-    "P_S1": ("P", "{shot}_P_S1_nDisplayLit"),
     "P_S2": ("P", "{shot}_P_S2_nDisplayLit"),
-    "P_BACK": ("P", "{shot}_P_BACK_nDisplayLit"),
     "S_S1": ("S", "{shot}_S_S1_nDisplayLit"),
-    "S_S2": ("S", "{shot}_S_S2_nDisplayLit"),
     "S_BACK": ("S", "{shot}_S_BACK_nDisplayLit"),
 }
 
 # Stable order for display / loops.
-PASS_ORDER = ["P_S1", "P_S2", "P_BACK", "S_S1", "S_S2", "S_BACK"]
+PASS_ORDER = ["P_S2", "S_S1", "S_BACK"]
 
 EXR_NUMBER_PATTERN = re.compile(r"_(\d+)\.exr$", re.IGNORECASE)
 
@@ -533,23 +533,21 @@ def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None
             if subtype == "moi":
                 # Handle MOI shots (single .mov file)
                 mov_info: MovInfo = shot.get("mov_file", MovInfo(False))
-                render_time_str = mov_info.last_render_time
-                
-                if threshold_timestamp is not None and mov_info.last_mtime is not None:
-                    if mov_info.last_mtime < threshold_timestamp:
-                        render_time_str = f"🕐 {render_time_str}"
-                
+                is_old = (
+                    threshold_timestamp is not None
+                    and mov_info.last_mtime is not None
+                    and mov_info.last_mtime < threshold_timestamp
+                )
+                mov_icon = mov_info.status_icon + (" 🕐" if is_old else "")
+
                 row = {
                     "Shot": shot["shot"],
                     "Type": "Cinematics (MOI)",
                     "Status": status,
+                    "MOV": mov_icon,
                     "MOV File": mov_info.filename or "-",
-                    "MOV Last Render": render_time_str,
+                    "MOV Last Render": mov_info.last_render_time,
                 }
-                
-                if threshold_timestamp is not None:
-                    has_old = mov_info.last_mtime is not None and mov_info.last_mtime < threshold_timestamp
-                    row["Old Render"] = "🕐" if has_old else ""
             else:
                 # Handle HologramReplay shots (multiple cameras)
                 row = {
@@ -564,17 +562,16 @@ def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None
                 camera_names = sorted(cameras.keys())
                 for i, cam_name in enumerate(camera_names[:4]):  # Limit to 4 cameras
                     cam: MovInfo = cameras[cam_name]
-                    render_time_str = cam.last_render_time
+                    is_old = (
+                        threshold_timestamp is not None
+                        and cam.last_mtime is not None
+                        and cam.last_mtime < threshold_timestamp
+                    )
+                    icon = cam.status_icon + (" 🕐" if is_old else "")
                     
-                    is_old = False
-                    if threshold_timestamp is not None and cam.last_mtime is not None:
-                        if cam.last_mtime < threshold_timestamp:
-                            is_old = True
-                            render_time_str = f"🕐 {render_time_str}"
-                    
-                    row[f"Camera {i+1}"] = cam.status_icon
+                    row[f"Camera {i+1}"] = icon
                     row[f"Camera {i+1} File"] = cam.filename or "-"
-                    row[f"Camera {i+1} Last Render"] = render_time_str
+                    row[f"Camera {i+1} Last Render"] = cam.last_render_time
                 
                 # Fill empty camera slots
                 for i in range(len(camera_names), 4):
@@ -582,12 +579,6 @@ def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None
                     row[f"Camera {i+1} File"] = ""
                     row[f"Camera {i+1} Last Render"] = ""
                 
-                if threshold_timestamp is not None:
-                    has_old = any(
-                        c.last_mtime is not None and c.last_mtime < threshold_timestamp
-                        for c in cameras.values()
-                    )
-                    row["Old Render"] = "🕐" if has_old else ""
         else:
             # Handle regular shots
             status = "✅" if shot["all_complete"] else ("⚠️" if shot.get("pass_complete", False) else "❌")
@@ -598,31 +589,21 @@ def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None
                 "Passes": "✅" if shot.get("pass_complete", False) else "❌",
             }
             
-            # Track if any pass is old
-            has_old_render = False
-            
             for key in PASS_ORDER:
                 p: PassInfo = shot.get("passes", {}).get(key, PassInfo(False))
-                render_time_str = p.last_render_time
+                is_old = (
+                    threshold_timestamp is not None
+                    and p.last_mtime is not None
+                    and p.last_mtime < threshold_timestamp
+                )
+                icon = p.status_icon + (" 🕐" if is_old else "")
                 
-                # Check if render is old
-                is_old = False
-                if threshold_timestamp is not None and p.last_mtime is not None:
-                    if p.last_mtime < threshold_timestamp:
-                        is_old = True
-                        has_old_render = True
-                        render_time_str = f"🕐 {render_time_str}"
-                
-                row[f"{key}"] = p.status_icon
+                row[f"{key}"] = icon
                 row[f"{key} Frames"] = p.frame_count if p.exists else None
-                row[f"{key} Last Render"] = render_time_str
+                row[f"{key} Last Render"] = p.last_render_time
             
             row["Preview"] = "✅" if shot.get("preview_exists", False) else "❌"
             row["Preview Path"] = str(shot.get("preview_path") or "") if shot.get("preview_exists", False) else ""
-            
-            # Add age warning column if threshold is set
-            if threshold_timestamp is not None:
-                row["Old Render"] = "🕐" if has_old_render else ""
         
         records.append(row)
     
@@ -642,8 +623,6 @@ def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None
         
         if has_regular:
             ordered_cols.extend(["Passes", "Preview", "Preview Path"])
-            if threshold_timestamp is not None:
-                ordered_cols.append("Old Render")
             for key in PASS_ORDER:
                 ordered_cols.extend([f"{key}", f"{key} Frames", f"{key} Last Render"])
         elif has_cinematics:
@@ -653,28 +632,20 @@ def build_table(shots_data: List[Dict], age_threshold: Optional[datetime] = None
             
             if has_moi and has_hologram:
                 # Mixed cinematics - include both column sets
-                ordered_cols.extend(["Cameras", "MOV File", "MOV Last Render"])
-                if threshold_timestamp is not None:
-                    ordered_cols.append("Old Render")
+                ordered_cols.extend(["Cameras", "MOV", "MOV File", "MOV Last Render"])
                 for i in range(1, 5):
                     ordered_cols.extend([f"Camera {i}", f"Camera {i} File", f"Camera {i} Last Render"])
             elif has_moi:
                 # Only MOI shots
-                ordered_cols.extend(["MOV File", "MOV Last Render"])
-                if threshold_timestamp is not None:
-                    ordered_cols.append("Old Render")
+                ordered_cols.extend(["MOV", "MOV File", "MOV Last Render"])
             else:
                 # Only HologramReplay shots
                 ordered_cols.extend(["Cameras"])
-                if threshold_timestamp is not None:
-                    ordered_cols.append("Old Render")
                 for i in range(1, 5):
                     ordered_cols.extend([f"Camera {i}", f"Camera {i} File", f"Camera {i} Last Render"])
     else:
         # Fallback to old structure
         ordered_cols = ["Shot", "Status", "Passes", "Preview", "Preview Path"]
-        if threshold_timestamp is not None:
-            ordered_cols.append("Old Render")
         for key in PASS_ORDER:
             ordered_cols.extend([f"{key}", f"{key} Frames", f"{key} Last Render"])
     
@@ -750,11 +721,8 @@ def render_details(
                 cols[3].markdown(f"**Pass root:** `{shot['shot']}_P`")
 
                 pass_labels = [
-                    ("P_S1", "P Pass 1"),
                     ("P_S2", "P Pass 2"),
-                    ("P_BACK", "P Back"),
                     ("S_S1", "S Pass 1"),
-                    ("S_S2", "S Pass 2"),
                     ("S_BACK", "S Back"),
                 ]
                 for key, label in pass_labels:
@@ -1165,21 +1133,12 @@ def main() -> None:
             "Passes": st.column_config.TextColumn(width="small"),
             "Preview": st.column_config.TextColumn(width="small"),
             "Preview Path": st.column_config.TextColumn(width="large"),
-            "P_S1": st.column_config.TextColumn(width="small"),
-            "P_S1 Frames": st.column_config.NumberColumn(width="small"),
-            "P_S1 Last Render": st.column_config.TextColumn(width="small"),
             "P_S2": st.column_config.TextColumn(width="small"),
             "P_S2 Frames": st.column_config.NumberColumn(width="small"),
             "P_S2 Last Render": st.column_config.TextColumn(width="small"),
-            "P_BACK": st.column_config.TextColumn(width="small"),
-            "P_BACK Frames": st.column_config.NumberColumn(width="small"),
-            "P_BACK Last Render": st.column_config.TextColumn(width="small"),
             "S_S1": st.column_config.TextColumn(width="small"),
             "S_S1 Frames": st.column_config.NumberColumn(width="small"),
             "S_S1 Last Render": st.column_config.TextColumn(width="small"),
-            "S_S2": st.column_config.TextColumn(width="small"),
-            "S_S2 Frames": st.column_config.NumberColumn(width="small"),
-            "S_S2 Last Render": st.column_config.TextColumn(width="small"),
             "S_BACK": st.column_config.TextColumn(width="small"),
             "S_BACK Frames": st.column_config.NumberColumn(width="small"),
             "S_BACK Last Render": st.column_config.TextColumn(width="small"),
@@ -1190,6 +1149,7 @@ def main() -> None:
     has_hologram = any(s.get("type") == "cinematics" and s.get("subtype") == "hologram_replay" for s in shots_data)
     
     if has_moi:
+        column_config["MOV"] = st.column_config.TextColumn(width="small")
         column_config["MOV File"] = st.column_config.TextColumn(width="medium")
         column_config["MOV Last Render"] = st.column_config.TextColumn(width="small")
     
@@ -1200,11 +1160,8 @@ def main() -> None:
             column_config[f"Camera {i} File"] = st.column_config.TextColumn(width="medium")
             column_config[f"Camera {i} Last Render"] = st.column_config.TextColumn(width="small")
     
-    if enable_age_warning:
-        column_config["Old Render"] = st.column_config.TextColumn(
-            width="small",
-            help="🕐 indicates renders older than the threshold date"
-        )
+    # Age warning is shown inline in the status icon cells (✅/❌/⚠️ 🕐),
+    # so we don't need a separate "Old Render" column.
     
     st.dataframe(
         filtered,
